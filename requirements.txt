@@ -5,4 +5,5 @@ tqdm==4.66.4
 datasets==2.20.0
 streamlit==1.37.0
 groq
-python-dotenv
+python-dotenvdatasets
+datasets<4.0.0
