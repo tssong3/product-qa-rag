@@ -42,6 +42,17 @@ LIMITATIONS (worth naming explicitly):
   actual hallucination differences. This is a limitation of sentence-level,
   citation-based scoring: it's sensitive to the model's phrasing style, not
   just factual grounding.
+
+  # OBSERVED: a claim citing [1] with the accurate quote "awful" scored 0.47,
+  just under threshold — manually verified the source text ("Sound quality
+  is awful! Dont buy!") does contain the quoted claim accurately. The lower
+  score likely came from the claim's wrapper phrasing ("Review [1]
+  contradicts this by stating that...") not resembling the terse source
+  text, even though the core fact was correctly cited. This suggests
+  comparing only the quoted/core portion of a claim to the source — rather
+  than the full sentence including meta-commentary — could reduce false
+  negatives. Left as a known limitation / future improvement rather than
+  implemented, given time constraints.
 """
 
 import os
