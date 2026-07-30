@@ -1,64 +1,162 @@
 """
 verify.py — Hallucination check for generated answers.
 
-This is your project's differentiator — most basic RAG tutorials stop at
-generation. This file is intentionally left almost entirely to you, because
-being able to explain this logic in depth is the most valuable single thing
-this project can prove about you.
+APPROACH:
+Rather than checking each claim against the best-matching chunk anywhere in
+the retrieved set, this checks each claim specifically against the chunk(s)
+it cites (e.g. a sentence ending in [1] is checked against retrieved_chunks[0]).
+This catches "citation drift" — a claim that cites a source but doesn't
+actually match that source's content closely, which a generic best-match
+check would miss if the claim happened to resemble some other chunk instead.
 
-THE CORE IDEA (yours to implement):
-For each claim/sentence in the generated answer, check whether it's actually
-supported by the retrieved context. One reasonable approach:
+Claims with no citation at all are flagged separately and never counted as
+"supported," since the prompt design requires citations — an uncited claim
+is a prompt-compliance failure independent of whether it happens to be
+semantically similar to something in the context.
 
-  1. Split the generated answer into individual sentences/claims.
-  2. For each claim, compute its embedding (reuse sentence-transformers).
-  3. Compare it against the embeddings of the retrieved chunks using cosine
-     similarity.
-  4. If the best-matching chunk's similarity is below some threshold you
-     choose, flag that claim as "unverified" or "low confidence."
+LIMITATIONS (worth naming explicitly):
+- Embedding similarity catches semantic drift, but not subtler issues like
+  a claim that correctly combines two true facts into a false implication
+  ("battery lasts 8 hours" + "screen is bright" -> "bright screen for 8
+  hours of gaming" might not be directly supported by either individual
+  claim).
+- Sentence-level granularity means a sentence with one true and one false
+  sub-claim gets a single score, potentially averaging out the problem.
+- With more time/budget: a cross-encoder reranker (scores query+chunk pairs
+  jointly, more accurate than comparing separate embeddings) or a second
+  LLM call acting as a "judge" would likely catch more subtle issues than
+  cosine similarity alone.
 
-QUESTIONS YOU SHOULD BE ABLE TO ANSWER ABOUT YOUR OWN IMPLEMENTATION:
-- What threshold did you pick, and how did you pick it? (Try a few values
-  against known-good and known-bad examples — this is your "evaluation
-  methodology" story.)
-- What are the failure modes of this approach? (Hint: embedding similarity
-  catches semantic drift, but not subtler issues like a claim that combines
-  two true facts into a false implication. It's fine to have limitations —
-  just be able to name them.)
-- What would you do differently with more time/budget? (e.g., use a
-  stronger cross-encoder reranker instead of cosine similarity, or a
-  second LLM call as a "judge")
+  OBSERVED IN TESTING: in one test run, this citation-aware approach caught a
+  case where the model attributed an identical claim to two different chunks
+  ([1] and [5]) — only the correctly-attributed one scored as supported (0.647
+  vs 0.389). This demonstrates the mechanism works when misattribution occurs,
+  though generation is non-deterministic (temperature=0.2), so this specific
+  failure mode doesn't reproduce on every run. The point isn't that
+  misattribution always happens — it's that when it does, citation-aware
+  checking catches it, whereas a generic best-match-anywhere check would not.
 
-Write your implementation below. Keep the function signature so app.py can
-call it, but everything inside is yours.
+  OVERALL_SUPPORTED_RATIO OBSERVATIONS: across two test runs of the same query,
+  overall_supported_ratio varied between 0.375 and 0.625 — largely driven by
+  how many uncited summary/inferential sentences the model produced, not by
+  actual hallucination differences. This is a limitation of sentence-level,
+  citation-based scoring: it's sensitive to the model's phrasing style, not
+  just factual grounding.
 """
 
-from sentence_transformers import SentenceTransformer, util
+import os
+import re
+import sys
+import numpy as np
+from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
 
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+sys.path.append(os.path.dirname(__file__))
+from ingest import split_into_sentences
+from embed_index import EMBED_MODEL_NAME
+
+load_dotenv()
+client = InferenceClient(token=os.environ.get("HF_TOKEN"))
+
+MIN_SUPPORT_SIMILARITY = 0.5  # placeholder — tune against real examples, see notes below
 
 
-def verify_claims(generated_answer: str, retrieved_chunks: list[dict], threshold: float = 0.5) -> dict:
-    """
-    Returns something like:
-        {
-            "claims": [
-                {"text": "...", "supported": True, "best_match_score": 0.71},
-                {"text": "...", "supported": False, "best_match_score": 0.31},
-            ],
-            "overall_supported_ratio": 0.5,
-        }
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
 
-    TODO: implement the logic described above.
-    """
-    result = {"claims": [], "overall_supported_ratio": 0.0}
 
-    # YOUR IMPLEMENTATION HERE
+def _extract_citations(sentence: str) -> list[int]:
+    """Extract citation numbers like [1], [2] from a sentence."""
+    return [int(n) for n in re.findall(r"\[(\d+)\]", sentence)]
 
-    return result
+
+def _clean_sentence(sentence: str) -> str:
+    """Strip citation markers before embedding, so '[1]' doesn't pollute the claim's meaning."""
+    return re.sub(r"\[\d+\]", "", sentence).strip()
+
+
+def verify_claims(generated_answer: str, retrieved_chunks: list[dict], threshold: float = MIN_SUPPORT_SIMILARITY) -> dict:
+    sentences = split_into_sentences(generated_answer)
+
+    chunk_texts = [c["text"] for c in retrieved_chunks]
+    chunk_embeddings = [
+        np.array(client.feature_extraction(t, model=EMBED_MODEL_NAME))
+        for t in chunk_texts
+    ] if chunk_texts else []
+
+    claims = []
+    supported_count = 0
+
+    for sentence in sentences:
+        cited_indices = _extract_citations(sentence)
+        clean_text = _clean_sentence(sentence)
+        if not clean_text:
+            continue
+
+        claim_embedding = np.array(client.feature_extraction(clean_text, model=EMBED_MODEL_NAME))
+
+        valid_cited_indices = [i for i in cited_indices if 0 <= (i - 1) < len(chunk_embeddings)]
+
+        if valid_cited_indices:
+            scores = [
+                _cosine_similarity(claim_embedding, chunk_embeddings[i - 1])
+                for i in valid_cited_indices
+            ]
+            best_score = max(scores)
+            supported = best_score >= threshold
+        else:
+            # No valid citation — never counted as supported, regardless of
+            # similarity to unrelated chunks (see module docstring).
+            scores = [_cosine_similarity(claim_embedding, emb) for emb in chunk_embeddings]
+            best_score = max(scores) if scores else 0.0
+            supported = False
+
+        if supported:
+            supported_count += 1
+
+        claims.append({
+            "text": clean_text,
+            "cited_chunks": cited_indices,
+            "supported": supported,
+            "best_match_score": round(best_score, 3),
+            "has_valid_citation": bool(valid_cited_indices),
+        })
+
+    overall_ratio = supported_count / len(claims) if claims else 0.0
+
+    return {
+        "claims": claims,
+        "overall_supported_ratio": round(overall_ratio, 3),
+    }
 
 
 if __name__ == "__main__":
-    # Once implemented, test with a deliberately fabricated claim to confirm
-    # your verification actually catches it.
-    pass
+    from retrieve import retrieve
+    from generate import generate_answer
+
+    query = "is this good for gaming"
+    results = retrieve(query)
+    chunks = [
+        {"text": doc, "product_title": meta["product_title"], "chunk_id": cid}
+        for doc, meta, cid in zip(
+            results["documents"][0], results["metadatas"][0], results["ids"][0]
+        )
+    ]
+    answer = generate_answer(query, chunks)
+    print("=== Generated Answer ===")
+    print(answer)
+
+    print("\n=== Verification (real answer) ===")
+    verification = verify_claims(answer, chunks)
+    for claim in verification["claims"]:
+        status = "✓" if claim["supported"] else "✗"
+        print(f"{status} [{claim['best_match_score']}] {claim['text'][:80]}")
+    print(f"\nOverall supported ratio: {verification['overall_supported_ratio']}")
+
+    # Deliberately fabricated claim — should score low / be flagged
+    fake_answer = "This product can fly and has a built-in coffee maker [1]."
+    print("\n=== Verification (fabricated claim, should be flagged) ===")
+    fake_verification = verify_claims(fake_answer, chunks)
+    for claim in fake_verification["claims"]:
+        status = "✓" if claim["supported"] else "✗"
+        print(f"{status} [{claim['best_match_score']}] {claim['text'][:80]}")
