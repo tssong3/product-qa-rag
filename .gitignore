@@ -3,8 +3,8 @@ __pycache__/
 *.pyc
 data/*.csv
 data/*.parquet
-data/chroma_db/
 .env
 .DS_Storedata/*.csv
 data/*.jsonl
 .DS_Store
+data/vector_store.json

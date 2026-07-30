@@ -1,51 +1,72 @@
 """
-embed_index.py — Embed chunks and load them into ChromaDB.
+embed_index.py — Embed chunks and load them into a vector store.
 
-This file is mostly plumbing (mechanical, fine to use as-is). The one thing
-worth understanding well enough to explain: WHY this embedding model, and
-what its limitations are (e.g., MiniLM is fast and free but less accurate
-than larger models — that's a real tradeoff you made, be ready to say so).
+Note: embeddings are generated via Hugging Face's hosted Inference API
+(hardware-driven — PyTorch dropped Intel macOS wheel support, so local
+sentence-transformers isn't installable on this machine). The vector store
+is a flat NumPy-based store rather than ChromaDB, also hardware-driven —
+ChromaDB's dependency chain has no pre-built wheels for Python 3.13 on this
+setup. Both are legitimate architecture choices at this project's scale,
+documented here for transparency.
 """
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-from src.ingest import Chunk
+import os
+import json
+import time
+from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
+from vector_store import VectorStore
 
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"  # small, free, fast — good enough to start
-COLLECTION_NAME = "product_reviews"
+load_dotenv()
+client = InferenceClient(token=os.environ.get("HF_TOKEN"))
+
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+BATCH_SIZE = 16
 
 
-def build_index(chunks: list[Chunk], persist_dir: str = "data/chroma_db"):
-    model = SentenceTransformer(EMBED_MODEL_NAME)
-    client = chromadb.PersistentClient(path=persist_dir)
+def load_chunks(path: str = "data/chunks.jsonl") -> list[dict]:
+    chunks = []
+    with open(path, "r") as f:
+        for line in f:
+            chunks.append(json.loads(line))
+    return chunks
 
-    # Fresh collection each run — fine for a portfolio project;
-    # in production you'd think about incremental updates instead.
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
-    collection = client.create_collection(COLLECTION_NAME)
 
-    texts = [c.text for c in chunks]
-    embeddings = model.encode(texts, show_progress_bar=True).tolist()
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    all_embeddings = []
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i:i + BATCH_SIZE]
+        for text in batch:
+            embedding = client.feature_extraction(text, model=EMBED_MODEL_NAME)
+            all_embeddings.append(embedding.tolist())
+        print(f"Embedded {min(i + BATCH_SIZE, len(texts))}/{len(texts)}")
+        time.sleep(0.5)
+    return all_embeddings
 
-    collection.add(
-        ids=[c.chunk_id for c in chunks],
+
+def build_index(chunks: list[dict], persist_path: str = "data/vector_store.json"):
+    texts = [c["text"] for c in chunks]
+    embeddings = embed_texts(texts)
+
+    store = VectorStore()
+    store.add(
+        ids=[c["chunk_id"] for c in chunks],
         embeddings=embeddings,
         documents=texts,
         metadatas=[
-            {"product_id": c.product_id, "product_title": c.product_title, "source_type": c.source_type}
+            {
+                "product_id": c["product_id"],
+                "product_title": c["product_title"],
+                "source_type": c["source_type"],
+            }
             for c in chunks
         ],
     )
-    print(f"Indexed {len(chunks)} chunks into '{COLLECTION_NAME}'")
-    return collection
+    store.save(persist_path)
+    print(f"Indexed {len(chunks)} chunks")
+    return store
 
 
 if __name__ == "__main__":
-    from src.ingest import load_raw_data, chunk_reviews
-
-    df = load_raw_data("data/raw_reviews.csv")
-    chunks = chunk_reviews(df)
+    chunks = load_chunks("data/chunks.jsonl")
     build_index(chunks)
