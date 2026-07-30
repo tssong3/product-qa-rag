@@ -5,4 +5,4 @@ datasets==2.20.0
 streamlit==1.37.0
 groq
 python-dotenv
-datasets<4.0.0numpy
+datasets<4.0.0numpystreamlit
