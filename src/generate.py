@@ -1,18 +1,19 @@
 """
 generate.py — Send retrieved context + query to an LLM via Groq's API.
 
-WHAT YOU NEED TO DESIGN:
-1. The prompt template. It needs to instruct the model to:
-   - Only use the provided context (not its own general knowledge)
-   - Cite which chunk/review each claim comes from
-   - Say "I don't have enough information" if the context doesn't answer
-     the question, rather than guessing
-2. How you format the retrieved chunks into the prompt (numbered list?
-   with product names? with source IDs so citations are traceable?)
-
-This prompt is the single biggest lever on hallucination rate. Iterate on
-it — try a few versions, and note in your README what you tried and what
-worked better.
+PROMPT DESIGN DECISIONS:
+1. Numbered context blocks with chunk IDs, so the model can cite [1], [2]
+   inline and those citations map back to real, traceable chunk_ids —
+   this is what verify.py checks claims against later.
+2. The "use only the provided context" and "say so if you don't know"
+   instructions are stated twice — once up top, once right before the
+   question — since models are more likely to follow instructions
+   reinforced close to the generation point than ones stated once and
+   effectively forgotten several paragraphs earlier.
+3. If retrieve.py's similarity filtering returns zero chunks, this skips
+   the LLM call entirely and returns a fixed refusal message. No point
+   spending an API call asking the model to say "I don't know" when we
+   already know there's nothing relevant to answer from.
 """
 
 import os
@@ -23,33 +24,50 @@ load_dotenv()
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL_NAME = "llama-3.1-8b-instant"
 
+NO_CONTEXT_RESPONSE = (
+    "I don't have enough information in the indexed reviews to answer that question."
+)
+
 
 def build_prompt(query: str, retrieved_chunks: list[dict]) -> str:
     """
-    TODO: design your prompt template here.
-
-    retrieved_chunks is a list of dicts like:
-        {"text": ..., "product_title": ..., "chunk_id": ...}
-
-    Starting structure to adapt:
-
-        You are answering questions using ONLY the context below.
-        If the context does not contain the answer, say so explicitly.
-        Cite the source chunk ID for every claim you make.
-
-        Context:
-        [1] (chunk_id_abc) Product: ... | Review: ...
-        [2] (chunk_id_xyz) Product: ... | Review: ...
-
-        Question: {query}
-
-        Answer (with citations like [1], [2]):
+    Builds a numbered-context prompt. Each chunk is labeled [1], [2], etc.,
+    with its chunk_id and product title, so the model can cite sources and
+    those citations can be checked against the actual retrieved chunks later.
     """
-    prompt = ""  # YOUR IMPLEMENTATION HERE
+    context_blocks = []
+    for i, chunk in enumerate(retrieved_chunks, start=1):
+        block = (
+            f"[{i}] (chunk_id: {chunk['chunk_id']}) "
+            f"Product: {chunk['product_title']}\n"
+            f"Review: {chunk['text']}"
+        )
+        context_blocks.append(block)
+
+    context = "\n\n".join(context_blocks)
+
+    prompt = f"""You are answering a question about a product using ONLY the customer reviews provided below. Do not use any outside knowledge about this or similar products.
+
+Rules:
+- Every claim you make must be supported by one of the numbered reviews below, and cited using its number, e.g. [1], [2].
+- If the reviews below do not contain enough information to answer the question, say so explicitly instead of guessing.
+
+Context:
+{context}
+
+Question: {query}
+
+Remember: only use the context above. If it doesn't answer the question, say you don't have enough information. Cite sources like [1], [2] for every claim.
+
+Answer:"""
+
     return prompt
 
 
 def generate_answer(query: str, retrieved_chunks: list[dict]) -> str:
+    if not retrieved_chunks:
+        return NO_CONTEXT_RESPONSE
+
     prompt = build_prompt(query, retrieved_chunks)
     response = client.chat.completions.create(
         model=MODEL_NAME,
@@ -60,16 +78,21 @@ def generate_answer(query: str, retrieved_chunks: list[dict]) -> str:
 
 
 if __name__ == "__main__":
-    # Quick manual test once retrieve.py and this file are both implemented
-    from src.retrieve import retrieve
+    from retrieve import retrieve
 
-    query = "is this good for gaming"
-    results = retrieve(query)
-    chunks = [
-        {"text": doc, "product_title": meta["product_title"], "chunk_id": cid}
-        for doc, meta, cid in zip(
-            results["documents"][0], results["metadatas"][0], results["ids"][0]
-        )
+    test_queries = [
+        "is this good for gaming",
+        "how does this compare to a Tesla",  # should trigger the no-context path
     ]
-    answer = generate_answer(query, chunks)
-    print(answer)
+
+    for query in test_queries:
+        print(f"\n=== Query: {query} ===")
+        results = retrieve(query)
+        chunks = [
+            {"text": doc, "product_title": meta["product_title"], "chunk_id": cid}
+            for doc, meta, cid in zip(
+                results["documents"][0], results["metadatas"][0], results["ids"][0]
+            )
+        ]
+        answer = generate_answer(query, chunks)
+        print(answer)
